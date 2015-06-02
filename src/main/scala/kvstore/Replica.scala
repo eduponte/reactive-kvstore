@@ -62,8 +62,26 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   /* TODO Behavior for the replica role. */
   val replica: Receive = {
+    case Get(k,id) => sender ! GetResult(k,kv.get(k),id)
+    case Snapshot(k,v,seq) => manageSnapshot(k,v,seq)
     case _ =>
   }
 
+  var snapshotSeq = List.empty[Long]
+  def manageSnapshot(k: String, v: Option[String], seq: Long): Unit = {
+    if (snapshotSeq.isEmpty && seq != 0) {
+      // swallow: no state change, no reaction
+    } else if ((snapshotSeq.isEmpty && seq == 0) || (!snapshotSeq.contains(seq) && snapshotSeq.forall(x => seq > x) && seq == snapshotSeq.head + 1)) {
+      v match {
+        case Some(vin) => kv += ((k,vin))
+        case None => kv -= k
+      }
+      snapshotSeq = seq :: snapshotSeq
+      sender ! SnapshotAck(k, seq)
+    } else {
+      // smaller than expected: this is from "the past", send an ack
+      sender ! SnapshotAck(k, seq)
+    }
+  }
 }
 
