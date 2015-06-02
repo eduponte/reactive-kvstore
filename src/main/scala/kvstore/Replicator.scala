@@ -22,7 +22,6 @@ class Replicator(val replica: ActorRef) extends Actor {
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
 
-  var seqs = Map.empty[Long, Long]
   // map from sequence number to pair of sender and request
   var acks = Map.empty[Long, (ActorRef, Replicate, Cancellable)]
   // a sequence of not-yet-sent snapshots (you can disregard this if not implementing batching)
@@ -37,23 +36,9 @@ class Replicator(val replica: ActorRef) extends Actor {
 
 
   def replicate(k: String, v: Option[String], id: Long, msg: Replicate): Unit = {
-    val cancellableRetry = context.system.scheduler.scheduleOnce(200 milliseconds) {
-      self ! Replicate(k, v, id)
-    }
-
-    seqs.get(id) match {
-      case Some(seq) => {
-        val ack = acks(seq)
-        acks.updated(seq,(ack._1, ack._2, cancellableRetry)) // replace with new cancellable
-        replica ! Snapshot(k, v, seq)
-      }
-      case None => {
-        acks += _seqCounter -> ((sender, msg, cancellableRetry))
-        seqs += ((id, _seqCounter))
-        replica ! Snapshot(k, v, _seqCounter)
-        nextSeq
-      }
-    }
+    val cancellableRetry = context.system.scheduler.schedule(0.millis,200.millis,replica,Snapshot(k, v, _seqCounter))
+    acks += _seqCounter -> ((sender, msg, cancellableRetry))
+    nextSeq
   }
 
   def confirmReplication(seq: Long): Unit = {
