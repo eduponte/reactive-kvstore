@@ -1,16 +1,12 @@
 package kvstore
 
-import akka.actor.{ OneForOneStrategy, Props, ActorRef, Actor }
+import akka.actor._
 import kvstore.Arbiter._
 import scala.collection.immutable.Queue
 import akka.actor.SupervisorStrategy.Restart
 import scala.annotation.tailrec
 import akka.pattern.{ ask, pipe }
-import akka.actor.Terminated
 import scala.concurrent.duration._
-import akka.actor.PoisonPill
-import akka.actor.OneForOneStrategy
-import akka.actor.SupervisorStrategy
 import akka.util.Timeout
 
 object Replica {
@@ -21,6 +17,8 @@ object Replica {
   case class Insert(key: String, value: String, id: Long) extends Operation
   case class Remove(key: String, id: Long) extends Operation
   case class Get(key: String, id: Long) extends Operation
+
+  case class ReplicationCleanup(id: Long)
 
   sealed trait OperationReply
   case class OperationAck(id: Long) extends OperationReply
@@ -54,6 +52,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
   arbiter ! Join
 
+  var replicationReqs = Map.empty[Long,(ActorRef, Int, Cancellable)]
+
   def receive = {
     case JoinedPrimary   => context.become(leader)
     case JoinedSecondary => context.become(replica)
@@ -62,8 +62,65 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   /* TODO Behavior for  the leader role. */
   val leader: Receive = {
     case Get(k,id) => sender ! GetResult(k,kv.get(k),id)
-    case Insert(k,v,id) => kv += ((k,v)); sender ! OperationAck(id)
-    case Remove(k,id) => kv -= k; sender ! OperationAck(id)
+
+    case Insert(k,v,id) =>
+      val cancellableReplication = context.system.scheduler.scheduleOnce(1.second, self, ReplicationCleanup(id))
+      replicationReqs += (id -> (sender,0,cancellableReplication))
+      kv += ((k,v))
+      replicators.foreach(_ ! Replicate(k,Some(v),id))
+      context.actorOf(PersistenceSupervisor.props(self, persistence, Persist(k, Some(v), id), Replicated(k,id)))
+
+    case Replicated(k,id) =>
+      val replicationReq = replicationReqs(id)
+      replicationReq match {
+        case (client, acksReceived, cancellable) =>
+          if (acksReceived < replicators.size - 1) {
+            replicationReqs += (id -> (client,acksReceived + 1, cancellable))
+          } else {
+            cancellable.cancel()
+            replicationReqs -= id
+            client ! OperationAck(id)
+          }
+        case _ =>
+      }
+
+    case ReplicationCleanup(id) =>
+      val replicationReq = replicationReqs(id)
+      replicationReq match {
+        case (client, acksReceived, cancellable) =>
+          replicationReqs -= id
+          client ! OperationFailed(id)
+        case _ =>
+      }
+
+    case Remove(k,id) =>
+      val cancellableReplication = context.system.scheduler.scheduleOnce(1.second, self, ReplicationCleanup(id))
+      replicationReqs += (id -> (sender,0,cancellableReplication))
+      kv -= k
+      replicators.foreach(_ ! Replicate(k,None,id))
+      context.actorOf(PersistenceSupervisor.props(self, persistence, Persist(k, None, id), Replicated(k,id)))
+
+    case Replicas(replicas) =>
+      val deadSet = secondaries.keySet -- replicas
+      deadSet.foreach { rep =>
+        rep ! PoisonPill
+        secondaries(rep) ! PoisonPill
+      }
+      val newSet =  replicas -- secondaries.keySet
+      val newSecondaries = newSet.map(replica => replica -> context.actorOf(Replicator.props(replica))).toMap
+      var id = 0L
+      for {
+        (k,v) <- kv
+      } yield {
+        val cancellableReplication = context.system.scheduler.scheduleOnce(1.second, self, ReplicationCleanup(id))
+        replicationReqs += (id -> (sender,0,cancellableReplication))
+        newSecondaries.values.foreach(_ ! Replicate(k,Some(v),id))
+        context.actorOf(PersistenceSupervisor.props(self, persistence, Persist(k, None, id), Replicated(k,id)))
+        id += 1L
+      }
+
+      replicators = replicators ++ newSecondaries.values -- deadSet
+      secondaries = secondaries ++ newSecondaries -- deadSet
   }
 
   /* TODO Behavior for the replica role. */
