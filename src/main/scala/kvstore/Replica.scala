@@ -36,6 +36,10 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   import Persistence._
   import context.dispatcher
 
+  override val supervisorStrategy = OneForOneStrategy(maxNrOfRetries = 5) {
+    case _: Exception => SupervisorStrategy.Restart
+  }
+
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
@@ -45,6 +49,8 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   var secondaries = Map.empty[ActorRef, ActorRef]
   // the current set of replicators
   var replicators = Set.empty[ActorRef]
+
+  val persistence = context.actorOf(persistenceProps)
 
   arbiter ! Join
 
@@ -77,7 +83,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         case None => kv -= k
       }
       snapshotSeq = seq :: snapshotSeq
-      sender ! SnapshotAck(k, seq)
+      context.actorOf(PersistenceSupervisor.props(sender, persistence, Persist(k, v, seq), SnapshotAck(k, seq)))
     } else {
       // smaller than expected: this is from "the past", send an ack
       sender ! SnapshotAck(k, seq)
